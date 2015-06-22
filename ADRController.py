@@ -23,23 +23,6 @@ import threading
 import Tkinter
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2TkAgg
 
-"""Inherited from the Tkinter Entry widget, this just turns red when a limit is reached"""
-class EntryWithAlert(Tkinter.Entry):
-    def __init__(self, *args, **kwargs):
-        self.upper_limit = kwargs.pop('upper_limit',False)
-        self.lower_limit = kwargs.pop('lower_limit',False)
-        self.variable = kwargs['textvariable']
-        self.variable.trace('w',self.callback)
-        Tkinter.Entry.__init__(self,*args,**kwargs)
-        self.naturalBGColor = self.cget('disabledbackground')
-    def callback(self,*dummy):
-        if self.upper_limit != False or self.lower_limit != False:
-            x = self.variable.get()
-            if x == '' or float(x) > float(self.upper_limit) or float(x) < float(self.lower_limit):
-                self.configure(disabledbackground='red')
-            else:
-                self.configure(disabledbackground=self.naturalBGColor)
-
 """Searches through available devices with *IDN? and returns device with name that includes deviceName."""
 def getGPIB(deviceName):
     try: # Python 2.7
@@ -58,10 +41,7 @@ def getGPIB(deviceName):
                     return instrument
     except: pass
     message = 'Cannot find resource with search string "'+deviceName+'".  Make sure to turn all instruments on, and if they already are, try turning them on and off again. \n'
-    log.configure(state=Tkinter.NORMAL)
-    log.insert(1.0,message)
-    log.tag_add("redAlert", '1.0', '1.end')
-    log.configure(state=Tkinter.DISABLED)
+    log.log(message, alert=True)
     return None
 
 """ The SIM922 is a module that fits into the SIM900 mainframe, and in our setup, is used to measure
@@ -92,7 +72,7 @@ class SIM922:
 class RuOxTemperatureMonitor:
     def __init__(self):
         self.SIM900 = getGPIB('SIM900')
-        self.channel = 2 #the default channel for this is 2, corresponding to the FAA pill.  GGG pill is chan 1
+        self.channel = 0 #channel 2 is the FAA pill.  GGG pill is chan 1
         self.lastTime = time.time()
         self.setChannel(2)
     def getTimeConstant(self): #returns time constant in ms
@@ -162,33 +142,24 @@ class PowerSupply:
     def initiate(self):
         if self.getCurrent()-0.01 >= CURRENT_LIMIT:
             message = 'Current too high!  Manually lower before trying to run again.  Please quit now. \n'
-            log.configure(state=Tkinter.NORMAL)
-            log.insert(1.0,message)
-            log.tag_add("redAlert", '1.0', '1.end')
-            log.configure(state=Tkinter.DISABLED)
+            log.log(message, alert=True)
         else:
             state = self.getOpsReg()
             if state == 'OutputOff':
                 message = 'Output Off.  Setting Current to '+str(CURRENT_LIMIT)+' Amps and voltage to 0 Volts. \n'
-                log.configure(state=Tkinter.NORMAL)
-                log.insert(1.0,message)
-                log.configure(state=Tkinter.DISABLED)
+                log.log(message)
                 self.reset()
                 self.setCurrent(CURRENT_LIMIT)
                 self.setVoltage(0)
                 self.setOutputOn()
             elif state == 'CV Mode':
                 message = 'Starting in CV Mode.  Setting Current to '+str(CURRENT_LIMIT)+' Amps. \n'
-                log.configure(state=Tkinter.NORMAL)
-                log.insert(1.0,message)
-                log.configure(state=Tkinter.DISABLED)
+                log.log(message)
                 self.setCurrent( CURRENT_LIMIT )
             elif state == 'CC Mode':
                 V_now = self.getVoltage()
                 message = 'Starting in CC Mode.  Setting Current to '+str(CURRENT_LIMIT)+' Amps and voltage to '+str(V_now)+' Volts. \n'
-                log.configure(state=Tkinter.NORMAL)
-                log.insert(1.0,message)
-                log.configure(state=Tkinter.DISABLED)
+                log.log(message)
                 V_now = self.getVoltage()
                 self.setVoltage( V_now )
                 self.setCurrent( CURRENT_LIMIT )
@@ -200,17 +171,12 @@ class PowerSupply:
     backEMF < MAGNET_VOLTAGE_LIMIT. Called when Mag Up button is pressed. """
 def magUp():
     message = 'Beginning to mag up to '+str(CURRENT_LIMIT)+' Amps. \n'
-    log.configure(state=Tkinter.NORMAL)
-    log.insert(1.0,message)
-    log.configure(state=Tkinter.DISABLED)
+    log.log(message)
     sim922 = SIM922()
     ps = PowerSupply()
     if ps.instrumentIsConnected() == False:
         message = 'Power Supply not connected.  Please turn it on and restart program. \n'
-        log.configure(state=Tkinter.NORMAL)
-        log.insert(1.0,message)
-        log.tag_add("redAlert", '1.0', '1.end')
-        log.configure(state=Tkinter.DISABLED)
+        log.log(message, alert=True)
         return
     class local:
         _job = ''
@@ -223,9 +189,7 @@ def magUp():
         magUpButton.configure(text='Mag Up', command=magUp)
         regulateButton.configure(state=Tkinter.NORMAL)
         message = 'Magging up stopped at a current of '+str(ps.getCurrent())+' Amps. \n'
-        log.configure(state=Tkinter.NORMAL)
-        log.insert(1.0,message)
-        log.configure(state=Tkinter.DISABLED)
+        log.log(message)
     def increaseV():
         I_now = ps.getCurrent()
         dI = I_now-local.lastI
@@ -246,9 +210,7 @@ def magUp():
             magUpButton.configure(text='Mag Up', command=magUp)
             regulateButton.configure(state=Tkinter.NORMAL)
             message = 'Finished magging up. '+str(ps.getCurrent())+' Amps reached. \n'
-            log.configure(state=Tkinter.NORMAL)
-            log.insert(1.0,message)
-            log.configure(state=Tkinter.DISABLED)
+            log.log(message)
     magUpButton.configure(text='Stop Magging Up', command=cancelMagUp)
     regulateButton.configure(state=Tkinter.DISABLED)
     increaseV()
@@ -264,15 +226,10 @@ def regulate():
     ps = PowerSupply()
     if ps.instrumentIsConnected() == False:
         message = 'Power Supply not connected.  Please turn it on and restart program. \n'
-        log.configure(state=Tkinter.NORMAL)
-        log.insert(1.0,message)
-        log.tag_add("redAlert", '1.0', '1.end')
-        log.configure(state=Tkinter.DISABLED)
+        log.log(message, alert=True)
         return
     message = 'Starting regulation cycle from '+str(ps.getCurrent())+' Amps. \n'
-    log.configure(state=Tkinter.NORMAL)
-    log.insert(1.0,message)
-    log.configure(state=Tkinter.DISABLED)
+    log.log(message)
     print 'beginning regulation'
     print 'V\tbackEMF\tdV/dT\tdV'
     class local:
@@ -288,9 +245,7 @@ def regulate():
         regulateButton.configure(text='Regulate', command=regulate)
         magUpButton.configure(state=Tkinter.NORMAL)
         message = 'Regulation stopped at a current of '+str(ps.getCurrent())+' Amps. \n'
-        log.configure(state=Tkinter.NORMAL)
-        log.insert(1.0,message)
-        log.configure(state=Tkinter.DISABLED)
+        log.log(message)
     def oneRegCycle():
         backEMF = sim922.getMagnetVoltage()
         V_now = ps.getVoltage()
@@ -339,9 +294,7 @@ def regulate():
             regulateButton.configure(text='Regulate', command=regulate)
             magUpButton.configure(state=Tkinter.NORMAL)
             message = 'Regulation has completed.  Mag up and try again. \n'
-            log.configure(state=Tkinter.NORMAL)
-            log.insert(1.0,message)
-            log.configure(state=Tkinter.DISABLED)
+            log.log(message)
     regulateButton.configure(text='Stop Regulating', command=cancelRegulate)
     magUpButton.configure(state=Tkinter.DISABLED)
     oneRegCycle()
@@ -349,21 +302,20 @@ def regulate():
 
 """ This takes care of the real time temperature plotting. It starts immediately upon starting the program, and never stops. """
 tempHistory = []
+timeStamps = []
 def tempPlot():
     class local:
         i = 0
         GGGTemp = 0
         FAATemp = 0
         ruoxChan = 'FAA'
+        startTime = time.time()
     sim922 = SIM922()
     ruox = RuOxTemperatureMonitor()
     ps = PowerSupply()
     if ps.instrumentIsConnected() == False:
         message = 'Power Supply not connected.  Please turn it on and restart program. \n'
-        log.configure(state=Tkinter.NORMAL)
-        log.insert(1.0,message)
-        log.tag_add("redAlert", '1.0', '1.end')
-        log.configure(state=Tkinter.DISABLED)
+        log.log(message, alert=True)
     ax = fig.add_subplot(111)
     ax2 = ax.twinx()
     ax.set_title('Realtime Temperature Readout')
@@ -404,6 +356,7 @@ def tempPlot():
                 local.ruoxChan = 'FAA'
         newTemps += [local.GGGTemp,local.FAATemp]
         tempHistory.append(newTemps)
+        timeStamps.append(time.time() - local.startTime)
         stage60K.set_xdata(numpy.append(stage60K.get_xdata(),local.i))
         stage60K.set_ydata(numpy.append(stage60K.get_ydata(),tempHistory[-1][0]))
         stage03K.set_xdata(numpy.append(stage03K.get_xdata(),local.i))
@@ -413,19 +366,21 @@ def tempPlot():
         stageFAA.set_xdata(numpy.append(stageFAA.get_xdata(),local.i))
         stageFAA.set_ydata(numpy.append(stageFAA.get_ydata(),tempHistory[-1][3]))
         #rescale axes, with the x being scaled by the slider
-        try:
-            if t60K.get() == 0: ax.lines.remove(stage60K)
-            if t3K.get() == 0: ax.lines.remove(stage03K)
-            if tGGGK.get() == 0: ax.lines.remove(stageGGG)
-            if tFAA.get() == 0: ax.lines.remove(stageFAA)
-        except: pass
-        ax.relim()
+        lineAndVar = {stage60K:t60K, stage03K:t3K, stageGGG:tGGG, stageFAA:tFAA}
+        ignoreSetBounds = True
+        for line in lineAndVar.keys():
+            if lineAndVar[line].get() == 0: line.set_visible(False)
+            else:
+                line.set_visible(True)
+                xy = numpy.vstack(line.get_data()).T
+                ax.dataLim.update_from_data_xy(xy, ignore=ignoreSetBounds)
+                ignoreSetBounds = False
         xMin = local.i-wScale.get()
         if wScale.get() == 600: xMin = 0
         if len(tempHistory)>1: ax.set_xlim(xMin,local.i)
         ax.autoscale_view(scalex=False)
         #add labels with temps on the right
-        labelLevels = newTemps
+        labelLevels = list(newTemps)
         for k in range(len(newTemps)):
             for j in range(k+1,len(newTemps)):
                 minLabelSpread = (ax.get_ylim()[1]-ax.get_ylim()[0])/50
@@ -452,7 +407,10 @@ def _quit():
     dt = datetime.datetime.now()
     dateAppend = dt.strftime("_%y%m%d_%I%M")
     try:
-        np.savetxt(filePath+'\\temperatures'+dateAppend+'.txt',tempHistory,delimiter='\t')
+        timeStampsArray = numpy.array([timeStamps])
+        tempsArray = numpy.array(tempHistory)
+        saveArray = numpy.concatenate((timeStampsArray,tempsArray.T)).T
+        np.savetxt(filePath+'\\temperatures'+dateAppend+'.txt',saveArray,delimiter='\t')
         f = open(filePath+'\\log'+dateAppend+'.txt', 'w')
         f.write( log.get("1.0",Tkinter.END) )
         f.close()
@@ -462,14 +420,47 @@ def _quit():
     root.destroy()  # this is necessary on Windows to prevent
                     # Fatal Python Error: PyEval_RestoreThread: NULL tstate
 
+
+"""Inherited from the Tkinter Entry widget, this just turns red when a limit is reached"""
+class EntryWithAlert(Tkinter.Entry):
+    def __init__(self, *args, **kwargs):
+        self.upper_limit = kwargs.pop('upper_limit',False)
+        self.lower_limit = kwargs.pop('lower_limit',False)
+        self.variable = kwargs['textvariable']
+        self.variable.trace('w',self.callback)
+        Tkinter.Entry.__init__(self,*args,**kwargs)
+        self.naturalBGColor = self.cget('disabledbackground')
+    def callback(self,*dummy):
+        if self.upper_limit != False or self.lower_limit != False:
+            x = self.variable.get()
+            if x == '' or float(x) > float(self.upper_limit) or float(x) < float(self.lower_limit):
+                self.configure(disabledbackground='red')
+            else:
+                self.configure(disabledbackground=self.naturalBGColor)
+
+"""This class inherits a Tkinter Text widget to make a simple log box.  It will log an entry,
+and set the color to red if alert is set to True.  A time stamp is automatically added."""
+class LogBox(Tkinter.Text):
+    def __init__(self, *args, **kwargs):
+        Tkinter.Text.__init__(self,*args,**kwargs)
+        self.tag_config("redAlert", background="red")
+        self.configure(state=Tkinter.DISABLED)
+    def log(self, message, alert=False):
+        dt = datetime.datetime.now()
+        messageWithTimeStamp = dt.strftime("[%m/%d/%y %H:%M:%S]") + message
+        self.configure(state=Tkinter.NORMAL)
+        self.insert(1.0,messageWithTimeStamp)
+        if alert: self.tag_add("redAlert", '1.0', '1.end')
+        self.configure(state=Tkinter.DISABLED)
+
 root = Tkinter.Tk()
 root.wm_title('ADR Magnet Controller')
+w, h = root.winfo_screenwidth(), root.winfo_screenheight()
+root.geometry("%dx%d+0+0" % (w/2, 0.9*h))
 
 #error/message box log
-log = Tkinter.Text(master=root, height=5)
+log = LogBox(master=root, height=5)
 log.pack(side=Tkinter.TOP, fill=Tkinter.X)
-log.tag_config("redAlert", background="red")
-log.configure(state=Tkinter.DISABLED)
 
 # temp plot
 fig = pylab.figure()
@@ -482,7 +473,7 @@ toolbar = NavigationToolbar2TkAgg( canvas, root )
 toolbar.update()
 canvas._tkcanvas.pack(side=Tkinter.TOP, fill=Tkinter.BOTH, expand=1)
 
-#which temp plots should I show?
+#which temp plots should I show? (checkboxes)
 tempSelectFrame = Tkinter.Frame(root)
 tempSelectFrame.pack(side=Tkinter.TOP)
 t60K = Tkinter.IntVar()
@@ -493,13 +484,13 @@ t60K.set(0)
 t3K.set(1)
 tGGG.set(0)
 tFAA.set(1)
-t1checkbox = Tkinter.Checkbutton(tempSelectFrame, text = '60K Stage', variable=t60K)
+t1checkbox = Tkinter.Checkbutton(tempSelectFrame, text = '60K Stage', variable=t60K, fg='blue')
 t1checkbox.pack(side=Tkinter.LEFT)
-t2checkbox = Tkinter.Checkbutton(tempSelectFrame, text = '3K Stage', variable=t3K)
+t2checkbox = Tkinter.Checkbutton(tempSelectFrame, text = '3K Stage', variable=t3K, fg='forest green')
 t2checkbox.pack(side=Tkinter.LEFT)
-t3checkbox = Tkinter.Checkbutton(tempSelectFrame, text = '1K Stage (GGG)', variable=tGGG)
+t3checkbox = Tkinter.Checkbutton(tempSelectFrame, text = '1K Stage (GGG)', variable=tGGG, fg='red')
 t3checkbox.pack(side=Tkinter.LEFT)
-t4checkbox = Tkinter.Checkbutton(tempSelectFrame, text = '50mK Stage (FAA)', variable=tFAA)
+t4checkbox = Tkinter.Checkbutton(tempSelectFrame, text = '50mK Stage (FAA)', variable=tFAA, fg='dark turquoise')
 t4checkbox.pack(side=Tkinter.LEFT)
 
 #scale to adjust time shown in temp plot
@@ -547,10 +538,7 @@ root.after(100,tempPlot)
 ps = PowerSupply()
 if ps.instrumentIsConnected() == False:
     message = 'Power Supply not connected.  Please turn it on and restart program. \n'
-    log.configure(state=Tkinter.NORMAL)
-    log.insert(1.0,message)
-    log.tag_add("redAlert", '1.0', '1.end')
-    log.configure(state=Tkinter.DISABLED)
+    log.log(message, alert=True)
 else:
     ps.initiate()
 Tkinter.mainloop()
