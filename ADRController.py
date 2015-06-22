@@ -2,11 +2,11 @@ SIM922_SLOT = 5 #Diode Temp Monitor
 SIM921_SLOT = 1 #AC Resistance Bridge
 SIM925_SLOT = 6 #multiplexer
 
-MAGNET_VOLTAGE_LIMIT = 0.05     #Back EMF limit in Volts
+MAGNET_VOLTAGE_LIMIT = 0.1      #Back EMF limit in Volts
 MAG_UP_dV = 0.003               #[V/step] How much do we increase the voltage by every second when maggin up? HPD Manual uses 10mV=0.01V, 2.5V/30min=1.4mV/s ==> Let's use a middle rate of 3mV/step. (1 step is about 1s)
 CURRENT_LIMIT = 9               #Max Current in Amps
 VOLTAGE_LIMIT = 3               #Maxx Voltage in Volts.  At 9A, we usually get about 2.5-2.7V, so this shouldn't need to be more than 3
-MAGNET_VOLTAGE_GAIN = 0.101       #Regulate loop uses a PID-esque process.  This is the gain constant.
+MAGNET_VOLTAGE_GAIN = 0.1       #Regulate loop uses a PID-esque process.  This is the gain constant.
 dVdT_LIMIT = 0.008              #Keep dV/dt to under this value [V/s]
 dIdt_MAGUP_LIMIT = 9./(30*60)   #limit on the rate at which we allow current to increase in amps/s (we want 9A over 30 min)
 dIdt_REGULATE_LIMIT = 9./(40*60)#limit on the rate at which we allow current to change in amps/s (we want 9A over 40 min)
@@ -26,15 +26,16 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 """Inherited from the Tkinter Entry widget, this just turns red when a limit is reached"""
 class EntryWithAlert(Tkinter.Entry):
     def __init__(self, *args, **kwargs):
-        self.limit = kwargs.pop('limit',False)
+        self.upper_limit = kwargs.pop('upper_limit',False)
+        self.lower_limit = kwargs.pop('lower_limit',False)
         self.variable = kwargs['textvariable']
         self.variable.trace('w',self.callback)
         Tkinter.Entry.__init__(self,*args,**kwargs)
         self.naturalBGColor = self.cget('disabledbackground')
     def callback(self,*dummy):
-        if self.limit != False:
+        if self.upper_limit != False or self.lower_limit != False:
             x = self.variable.get()
-            if x == '' or float(x) > float(self.limit):
+            if x == '' or float(x) > float(self.upper_limit) or float(x) < float(self.lower_limit):
                 self.configure(disabledbackground='red')
             else:
                 self.configure(disabledbackground=self.naturalBGColor)
@@ -91,24 +92,39 @@ class SIM922:
 class RuOxTemperatureMonitor:
     def __init__(self):
         self.SIM900 = getGPIB('SIM900')
-    def getTemperatures(self):
-        temperatures = []
-        if(True):
-            self.SIM900.write("CONN %d,'xyz'" %SIM925_SLOT)
-            self.SIM900.write("CHAN 1")
-            self.SIM900.write("xyz")
-            self.SIM900.write("CONN %d,'xyz'" %SIM921_SLOT)
-            self.SIM900.write("CURV 1")
-            temperatures.append( float(self.SIM900.ask("TVAL?").strip('\x00')) )
-            self.SIM900.write("xyz")
-            self.SIM900.write("CONN %d,'xyz'" %SIM925_SLOT)
-            self.SIM900.write("CHAN 2")
-            self.SIM900.write("xyz")
+        self.channel = 2 #the default channel for this is 2, corresponding to the FAA pill.  GGG pill is chan 1
+        self.lastTime = time.time()
+        self.setChannel(2)
+    def getTimeConstant(self): #returns time constant in ms
+        timeConstCodes = {'-1':'filter off', '0':0.3, '1':1, '2':3, '3':10, '4':30, '5':100, '6':300}
         self.SIM900.write("CONN %d,'xyz'" %SIM921_SLOT)
-        self.SIM900.write("CURV 2")
-        temperatures.append( float(self.SIM900.ask("TVAL?").strip('\x00')) )
+        returnCode = self.SIM900.ask("TCON?").strip('\x00')
+        t = timeConstCodes[returnCode]
         self.SIM900.write("xyz")
-        return temperatures
+        return t
+    def getTimeSinceChannelSet(self): #returns the time since the channel was changed in ms
+        return time.time() - self.lastTime
+    def getChannel(self):
+        return self.channel
+    def setChannel(self, channel):
+        if self.channel != channel:
+            self.channel = channel
+            #set channel on multiplexer
+            self.SIM900.write("CONN %d,'xyz'" %SIM925_SLOT)
+            self.SIM900.write("CHAN %d" %channel)
+            self.SIM900.write("xyz")
+            #set curve on AC resistance bridge
+            self.SIM900.write("CONN %d,'xyz'" %SIM921_SLOT)
+            self.SIM900.write("CURV %d" %channel)
+            self.SIM900.write("xyz")
+            #set lastTime
+            self.lastTime = time.time()
+    def getTemperature(self):
+        self.SIM900.write("CONN %d,'xyz'" %SIM921_SLOT)
+        gpibstring = self.SIM900.ask("TVAL?")
+        T = float(gpibstring.strip('\x00')) 
+        self.SIM900.write("xyz")
+        return T
 """ This class should be able to manage all controls for the power supply.  Setting Voltage and Current works
     just as it would if you were to turn the knobs on the power supply itself.  getObsReg() returns the operating
     mode of the power supply, ex: Current Control (CC). """
@@ -264,6 +280,7 @@ def regulate():
         lastTime = time.time()
         lastMagnetV = 0
         lastI = ps.getCurrent()
+        FAATemp = ruox.getTemperature()
     def cancelRegulate():
         if local._job is not None:
             root.after_cancel(local._job)
@@ -280,9 +297,10 @@ def regulate():
         I_now = ps.getCurrent()
         dI = I_now - local.lastI
         local.lastI = I_now
+        if ruox.getChannel() == 2: local.FAATemp = ruox.getTemperature()
         print str(V_now)+'\t'+str(backEMF)+'\t',
         #propose new voltage
-        dV = T_target-ruox.getTemperatures()[0]-backEMF*MAGNET_VOLTAGE_GAIN
+        dV = T_target-local.FAATemp-backEMF*MAGNET_VOLTAGE_GAIN
         dT = time.time()-local.lastTime
         if dT == 0: dT = 0.0000000001 #to prevent divide by zero error
         local.lastTime = time.time()
@@ -293,11 +311,12 @@ def regulate():
         if V_now + dV > VOLTAGE_LIMIT:
             dV = VOLTAGE_LIMIT - V_now
         # steady state limit
-        if local.lastMagnetV == backEMF:
-            if V_now < 0.6 or abs(dV) < 0.001:
-                dV = min(max(dV,-MAGNET_VOLTAGE_LIMIT-backEMF),MAGNET_VOLTAGE_LIMIT-backEMF)
-            else: dV = 0
-        else: dV = min(max(dV,-MAGNET_VOLTAGE_LIMIT-backEMF),MAGNET_VOLTAGE_LIMIT-backEMF)
+        if dV < 0:
+            dV = max(dV,backEMF-MAGNET_VOLTAGE_LIMIT)
+            if dV > 0: dV = 0
+        if dV > 0:
+            dV = min(dV, MAGNET_VOLTAGE_LIMIT-backEMF)
+            if dV < 0: dV = 0
         lastMagnetV = backEMF
         # limit by hard voltage increase limit
         if abs(dV/dT) > dVdT_LIMIT:
@@ -333,6 +352,9 @@ tempHistory = []
 def tempPlot():
     class local:
         i = 0
+        GGGTemp = 0
+        FAATemp = 0
+        ruoxChan = 'FAA'
     sim922 = SIM922()
     ruox = RuOxTemperatureMonitor()
     ps = PowerSupply()
@@ -349,9 +371,10 @@ def tempPlot():
     ax.set_ylabel('Temparture [K]')
     stage60K, = ax.plot([],[])
     stage03K, = ax.plot([],[])
-    stage50mK, = ax.plot([],[])
+    stageGGG, = ax.plot([],[])
+    stageFAA, = ax.plot([],[])
     def oneTempCycle():
-        global currentBackEMF, currentI, currentV
+        global currentBackEMF, currentI, currentV, t60K, t3K, tGGG, tFAA
         #update current and voltage data
         currentBackEMF.set( "{0:.3f}".format(sim922.getMagnetVoltage()) )
         if ps.instrumentIsConnected() == True:
@@ -360,18 +383,41 @@ def tempPlot():
         else:
             currentI.set('')
             currentV.set('')
-        #append temp data
+        #append diode temp data
         newTemps = sim922.getDiodeTemperatures()
-        newTemps.append(ruox.getTemperatures()[0])
+        #append the ruox temps, but can only measure every once in a while b/c of time constant
+        if ruox.getTimeSinceChannelSet() >= 10*ruox.getTimeConstant():
+            if local.ruoxChan == 'GGG': local.GGGTemp = ruox.getTemperature()
+            elif local.ruoxChan == 'FAA': local.FAATemp = ruox.getTemperature()
+            if tGGG.get() == 1 and tFAA.get() == 1:
+                if local.ruoxChan == 'GGG':
+                    ruox.setChannel(2)
+                    local.ruoxChan = 'FAA'
+                elif local.ruoxChan == 'FAA':
+                    ruox.setChannel(1)
+                    local.ruoxChan = 'GGG'
+            elif tGGG.get() == 1 and tFAA.get() == 0:
+                ruox.setChannel(1)
+                local.ruoxChan = 'GGG'
+            elif tGGG.get() == 0 and tFAA.get() == 1:
+                ruox.setChannel(2)
+                local.ruoxChan = 'FAA'
+        newTemps += [local.GGGTemp,local.FAATemp]
         tempHistory.append(newTemps)
         stage60K.set_xdata(numpy.append(stage60K.get_xdata(),local.i))
         stage60K.set_ydata(numpy.append(stage60K.get_ydata(),tempHistory[-1][0]))
         stage03K.set_xdata(numpy.append(stage03K.get_xdata(),local.i))
         stage03K.set_ydata(numpy.append(stage03K.get_ydata(),tempHistory[-1][1]))
-        stage50mK.set_xdata(numpy.append(stage50mK.get_xdata(),local.i))
-        stage50mK.set_ydata(numpy.append(stage50mK.get_ydata(),tempHistory[-1][2]))
+        stageGGG.set_xdata(numpy.append(stageGGG.get_xdata(),local.i))
+        stageGGG.set_ydata(numpy.append(stageGGG.get_ydata(),tempHistory[-1][2]))
+        stageFAA.set_xdata(numpy.append(stageFAA.get_xdata(),local.i))
+        stageFAA.set_ydata(numpy.append(stageFAA.get_ydata(),tempHistory[-1][3]))
         #rescale axes, with the x being scaled by the slider
-        try: ax.lines.remove(stage60K) #we dont actually want to see the 60K stage (it zooms out too much)
+        try:
+            if t60K.get() == 0: ax.lines.remove(stage60K)
+            if t3K.get() == 0: ax.lines.remove(stage03K)
+            if tGGGK.get() == 0: ax.lines.remove(stageGGG)
+            if tFAA.get() == 0: ax.lines.remove(stageFAA)
         except: pass
         ax.relim()
         xMin = local.i-wScale.get()
@@ -387,10 +433,10 @@ def tempPlot():
                     avgTemp = (newTemps[k]+newTemps[j])/2
                     labelLevels[k] = avgTemp + minLabelSpread/2*(newTemps[k]-avgTemp)/(abs(newTemps[k]-avgTemp)+0.0001) # + .0001 to prevent divide by 0 error
                     labelLevels[j] = avgTemp + minLabelSpread/2*(newTemps[j]-avgTemp)/(abs(newTemps[j]-avgTemp)+0.0001) # + .0001 to prevent divide by 0 error
-        labels = ['60K','3K','RuOx']
-        labels = [labels[l]+' ['+str(newTemps[l])+'K]' for l in range(len(labels))]
+        labels = ['60K','3K','GGG','FAA']
+        labels = [labels[l]+' ['+"{0:.3f}".format(newTemps[l])+'K]' for l in range(len(labels))]
         pylab.yticks(labelLevels,labels)
-        colorScheme = ['blue','green','red']
+        colorScheme = ['blue','green','red','teal']
         for n in range(len(newTemps)):
             l = ax2.yaxis.get_ticklabels()[n]
             l.set_color(colorScheme[n])
@@ -436,6 +482,26 @@ toolbar = NavigationToolbar2TkAgg( canvas, root )
 toolbar.update()
 canvas._tkcanvas.pack(side=Tkinter.TOP, fill=Tkinter.BOTH, expand=1)
 
+#which temp plots should I show?
+tempSelectFrame = Tkinter.Frame(root)
+tempSelectFrame.pack(side=Tkinter.TOP)
+t60K = Tkinter.IntVar()
+t3K = Tkinter.IntVar()
+tGGG = Tkinter.IntVar()
+tFAA = Tkinter.IntVar()
+t60K.set(0)
+t3K.set(1)
+tGGG.set(0)
+tFAA.set(1)
+t1checkbox = Tkinter.Checkbutton(tempSelectFrame, text = '60K Stage', variable=t60K)
+t1checkbox.pack(side=Tkinter.LEFT)
+t2checkbox = Tkinter.Checkbutton(tempSelectFrame, text = '3K Stage', variable=t3K)
+t2checkbox.pack(side=Tkinter.LEFT)
+t3checkbox = Tkinter.Checkbutton(tempSelectFrame, text = '1K Stage (GGG)', variable=tGGG)
+t3checkbox.pack(side=Tkinter.LEFT)
+t4checkbox = Tkinter.Checkbutton(tempSelectFrame, text = '50mK Stage (FAA)', variable=tFAA)
+t4checkbox.pack(side=Tkinter.LEFT)
+
 #scale to adjust time shown in temp plot
 wScale = Tkinter.Scale(master=root,label="Time Displayed [s]", from_=1, to=600,sliderlength=30,length=500, orient=Tkinter.HORIZONTAL)
 wScale.set(700)
@@ -465,13 +531,13 @@ currentBackEMF = Tkinter.StringVar() #current as in now, not as in amps
 currentI = Tkinter.StringVar()
 currentV = Tkinter.StringVar()
 Tkinter.Label(monitorFrame, text="Back EMF = ").pack(side=Tkinter.LEFT)
-backEMFField = EntryWithAlert(monitorFrame, textvariable=currentBackEMF, state=Tkinter.DISABLED, limit=MAGNET_VOLTAGE_LIMIT)
+backEMFField = EntryWithAlert(monitorFrame, textvariable=currentBackEMF, state=Tkinter.DISABLED, upper_limit=MAGNET_VOLTAGE_LIMIT)
 backEMFField.pack(side=Tkinter.LEFT)
 Tkinter.Label(monitorFrame, text="(V)   I = ").pack(side=Tkinter.LEFT)
-currentIField = EntryWithAlert(monitorFrame, textvariable=currentI, state=Tkinter.DISABLED, limit=CURRENT_LIMIT)
+currentIField = EntryWithAlert(monitorFrame, textvariable=currentI, state=Tkinter.DISABLED, upper_limit=CURRENT_LIMIT)
 currentIField.pack(side=Tkinter.LEFT)
 Tkinter.Label(monitorFrame, text="(A)   V = ").pack(side=Tkinter.LEFT)
-currentVField = EntryWithAlert(monitorFrame, textvariable=currentV, state=Tkinter.DISABLED, limit=VOLTAGE_LIMIT)
+currentVField = EntryWithAlert(monitorFrame, textvariable=currentV, state=Tkinter.DISABLED, upper_limit=VOLTAGE_LIMIT)
 currentVField.pack(side=Tkinter.LEFT)
 Tkinter.Label(monitorFrame, text="(V)").pack(side=Tkinter.LEFT)
 
