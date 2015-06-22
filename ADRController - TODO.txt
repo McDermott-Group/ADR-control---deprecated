@@ -1,0 +1,8 @@
+TODO/BUG LIST FOR ADR CONTROLLER
+
+[11/24/2014 by Ivan] The program stopped working during the temperature data acquision (see the screenshot).
+[11/18/2014 by Ivan] The program shouldn't stop if it can access the file (this can waste time when magging up or regulating) but a message should appear suggesting that the program should be restarted.
+[11/12/2014 by Ivan] The Regulate button is not accessible when the mag-up is finished. No message is displayed that says that the mag-up is finished. The button text is "Mag Up", not "Stop magging up".
+[11/10/2014 by Ivan] there is an issue with scalling when the 60K diode checked; the problem appeared at the end of a long record after zooming-in on some part of the plot; maybe it is still a good idea to have all themperature readings shown as numbers, so that there is always an easy excess to these numbers even the plotting doesn't work the way we expect
+
+- make zoom controls work better (how do I go back to normal, continuous plotting if I zoom in
