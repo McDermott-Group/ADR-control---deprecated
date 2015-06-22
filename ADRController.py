@@ -1,3 +1,11 @@
+"""
+New in this version:
+- new classes for Lakeshore 218 temp monitor, so we can use this program with the old ADRs.
+- added support for new classes above (not all classes fully developed yet). Change at bottom.
+- Changed the time scale to be in minutes instead of seconds, and extended it.
+- changed the way the toolbar at the bottom works, corrected the way it zooms (nan wasn't working with max/min)
+"""
+
 SIM922_SLOT = 5 #Diode Temp Monitor
 SIM921_SLOT = 1 #AC Resistance Bridge
 SIM925_SLOT = 6 #multiplexer
@@ -6,20 +14,21 @@ MAGNET_VOLTAGE_LIMIT = 0.1      #Back EMF limit in Volts
 MAG_UP_dV = 0.003               #[V/step] How much do we increase the voltage by every second when maggin up? HPD Manual uses 10mV=0.01V, 2.5V/30min=1.4mV/s ==> Let's use a middle rate of 3mV/step. (1 step is about 1s)
 CURRENT_LIMIT = 9               #Max Current in Amps
 VOLTAGE_LIMIT = 2               #Maxx Voltage in Volts.  At 9A, we usually get about 2.5-2.7V or 1.69V (with or without the external diode protection box), so this shouldn't need to be more than 3 or 2
-MAGNET_VOLTAGE_GAIN = 0.1       #Regulate loop uses a PID-esque process.  This is the gain constant.
+PID_KD = 0.07 					#Regulate loop uses a PID-esque process.  This is the gain constant based on the magnet backEMF (derivative part).
+PID_KP = 1						#proportional part of PID controller
+PID_KI = 0						#not currently used, or even implemented
 dVdT_LIMIT = 0.008              #Keep dV/dt to under this value [V/s]
 dIdt_MAGUP_LIMIT = 9./(30*60)   #limit on the rate at which we allow current to increase in amps/s (we want 9A over 30 min)
 dIdt_REGULATE_LIMIT = 9./(40*60)#limit on the rate at which we allow current to change in amps/s (we want 9A over 40 min)
 
 STEP_LENGTH = 1000              #How long is each regulation/mag up cycle in ms.  **Never set this less than 1000ms.**  The SRS SIM922 only measures once a second and this would cause runaway voltages/currents.
-FILE_PATH = 'Z:\\mcdermott-group\\ADR_log_files\\NEW_ADR'
+FILE_PATH = 'C:\\Users\\McDermott\\Desktop\\ADR Magnet Controller\\Development\\Python ADRController\\test_temp_log'#'Z:\\mcdermott-group\\ADR_log_files\\NEW_ADR'
 
 import visa, pyvisa
 import matplotlib as mpl
 mpl.use('TkAgg')
 import pylab, numpy
 import time, datetime
-import threading
 import Tkinter
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2TkAgg
 from operator import itemgetter
@@ -72,6 +81,18 @@ class SIM922:
         self.SIM900.write("xyz")
         magnetVoltages = [float(x) for x in diodeMonitorReturnString.split(',')][2:]
         return (abs(magnetVoltages[0])+abs(magnetVoltages[1]))/2
+
+""" This class implements the Lakeshore 218 temperature monitor for measuring the Diode Thermometers
+    in the old ADRs."""
+class LakeshoreTemperatureMonitor:
+    def __init__(self):
+        #The SIM900 is the mainframe rack into which all the other modules fit (ex: sim922) and commands must go through it
+        self.lakeshore = getGPIB('Lakeshore')
+    def getDiodeTemperatures(self):
+        self.lakeshore.write("*CLS")
+        diodeMonitorReturnString = self.lakeshore.ask("KRDG? 0").strip('\x00')
+        temperatures = [float(x) for x in diodeMonitorReturnString.split(',')][6:8]
+        return temperatures
 		
 """ This class implements both the SIM921 AC Resistance Bridge for measuring the RuOx temperature sensors,
     and the SIM925 Multiplexor to select which channel (read: RuOx detector) to read. The multiplexer clicks
@@ -215,11 +236,11 @@ class LogBox(Tkinter.Text):
             f.write( messageWithTimeStamp + '\n' )
 
 class ADRController(Tkinter.Tk):
-    def __init__(self,parent):
+    def __init__(self,parent, diodeTempMonitor=None, ruoxTempMonitor=None, magnetVoltageMonitor=None):
         Tkinter.Tk.__init__(self,parent)
         self.parent = parent
-        self.tempHistory = []
-        self.timeStamps = []
+        self.newTemps = [numpy.NaN,numpy.NaN,numpy.NaN,numpy.NaN]
+        self.timeStamps = numpy.array([])
         # vars used during each measurement cycle
         self.isRegulating = False
         self.isMaggingUp = False
@@ -232,7 +253,8 @@ class ADRController(Tkinter.Tk):
         self.dateAppend = dt.strftime("_%y%m%d_%H%M")
         #initialize and start measurement loop
         self.initializeWindow()
-        self.initializeInstruments()
+        self.initializeInstruments(diodeTempMonitor, ruoxTempMonitor, magnetVoltageMonitor)
+        self.executeExternalCommands()
         self.after(100, self.measurementCycle)
         self.after(200, self.renewPowerSupply)
     def initializeWindow(self):
@@ -259,9 +281,9 @@ class ADRController(Tkinter.Tk):
         self.canvas.show()
         self.canvas.get_tk_widget().pack(side=Tkinter.TOP, fill=Tkinter.BOTH, expand=1)
         #temp plot toolbar at bottom
-        toolbar = NavigationToolbar2TkAgg( self.canvas, root )
-        toolbar.update()
-        #toolbar.pack(side=Tkinter.BOTTOM, fill=Tkinter.X)
+        self.toolbar = NavigationToolbar2TkAgg( self.canvas, root )
+        self.toolbar.update()
+        #self.toolbar.pack(side=Tkinter.BOTTOM, fill=Tkinter.X)
         self.canvas._tkcanvas.pack(side=Tkinter.TOP, fill=Tkinter.BOTH, expand=1)
         #which temp plots should I show? (checkboxes)
         tempSelectFrame = Tkinter.Frame(root)
@@ -283,8 +305,8 @@ class ADRController(Tkinter.Tk):
         t4checkbox = Tkinter.Checkbutton(tempSelectFrame, text = '50mK Stage (FAA)', variable=self.tFAA, fg='dark turquoise')
         t4checkbox.pack(side=Tkinter.LEFT)
         #scale to adjust time shown in temp plot
-        self.wScale = Tkinter.Scale(master=root,label="Cycles Displayed (1 cycle ~ 1 sec)", from_=1, to=600,sliderlength=30,length=500, orient=Tkinter.HORIZONTAL)
-        self.wScale.set(600)
+        self.wScale = Tkinter.Scale(master=root,label="60*Cycles=Minutes Displayed (1 cycle ~ 1 sec)", from_=1, to=1440,sliderlength=30,length=500, orient=Tkinter.HORIZONTAL)
+        self.wScale.set(1440)
         self.wScale.pack(side=Tkinter.TOP)
         #frame for mag up and regulate controls
         magControlsFrame = Tkinter.Frame(root)
@@ -318,7 +340,7 @@ class ADRController(Tkinter.Tk):
         Tkinter.Label(monitorFrame, text="(V)").pack(side=Tkinter.LEFT)
         #X BUTTON
         self.protocol("WM_DELETE_WINDOW", self._quit)
-    def initializeInstruments(self):
+    def initializeInstruments(self, diodeTempMonitor, ruoxTempMonitor, magnetVoltageMonitor):
         """This method simply creates the instances of the power suply, sim922, and ruox temperature monitor."""
         self.ps = PowerSupply(self.log)
         con, err = self.ps.instrumentIsConnected()
@@ -328,16 +350,24 @@ class ADRController(Tkinter.Tk):
             self.log.log(message, alert=True)
         else:
             self.ps.initiate()
-        try: self.ruox = RuOxTemperatureMonitor()
-        except GPIBError as e: self.log.log(str(e),alert=True)
-        try: self.sim922 = SIM922()
-        except GPIBError as e: self.log.log(str(e),alert=True)
+        if ruoxTempMonitor == None:
+            try: ruoxTempMonitor = RuOxTemperatureMonitor()
+            except GPIBError as e: self.log.log(str(e),alert=True)
+        if diodeTempMonitor == None:
+            try: diodeTempMonitor = SIM922()
+            except GPIBError as e: self.log.log(str(e),alert=True)
+        if magnetVoltageMonitor == None:
+            try: magnetVoltageMonitor = SIM922()
+            except GPIBError as e: self.log.log(str(e),alert=True)
+        self.ruoxTempMonitor = ruoxTempMonitor
+        self.diodeTempMonitor = diodeTempMonitor
+        self.magnetVoltageMonitor = magnetVoltageMonitor
     def measurementCycle(self):
         """ This takes care of the real time temperature plotting. It starts immediately upon starting the program, and never stops. """
         i = self.cycle
         cycleStartTime = time.time()
         #update current and voltage data
-        self.currentBackEMF.set( "{0:.3f}".format(self.sim922.getMagnetVoltage()) )
+        self.currentBackEMF.set( "{0:.3f}".format(self.magnetVoltageMonitor.getMagnetVoltage()) )
         if self.ps.instrumentIsConnected()[0] == True:
             try:
                 self.currentI.set( "{0:.3f}".format(self.ps.getCurrent()) )
@@ -349,59 +379,61 @@ class ADRController(Tkinter.Tk):
             self.currentI.set('')
             self.currentV.set('')
         #append diode temp data
-        newTemps = self.sim922.getDiodeTemperatures()
+        self.newTemps = self.diodeTempMonitor.getDiodeTemperatures()
         #append the ruox temps, but can only measure every once in a while b/c of time constant
-        if self.ruox.getTimeSinceChannelSet() >= 10*self.ruox.getTimeConstant():
-            if self.ruoxChan == 'GGG': self.GGGTemp = self.ruox.getTemperature()
-            elif self.ruoxChan == 'FAA': self.FAATemp = self.ruox.getTemperature()
+        if self.ruoxTempMonitor.getTimeSinceChannelSet() >= 10*self.ruoxTempMonitor.getTimeConstant():
+            if self.ruoxChan == 'GGG': self.GGGTemp = self.ruoxTempMonitor.getTemperature()
+            elif self.ruoxChan == 'FAA': self.FAATemp = self.ruoxTempMonitor.getTemperature()
             if self.tGGG.get() == 1 and self.tFAA.get() == 1:
                 if self.ruoxChan == 'GGG':
-                    self.ruox.setChannel(2)
+                    self.ruoxTempMonitor.setChannel(2)
                     self.ruoxChan = 'FAA'
                 elif self.ruoxChan == 'FAA':
-                    self.ruox.setChannel(1)
+                    self.ruoxTempMonitor.setChannel(1)
                     self.ruoxChan = 'GGG'
             elif self.tGGG.get() == 1 and self.tFAA.get() == 0:
-                self.ruox.setChannel(1)
+                self.ruoxTempMonitor.setChannel(1)
                 self.ruoxChan = 'GGG'
             elif self.tGGG.get() == 0 and self.tFAA.get() == 1:
-                self.ruox.setChannel(2)
+                self.ruoxTempMonitor.setChannel(2)
                 self.ruoxChan = 'FAA'
         if self.tGGG.get() == 0 or self.GGGTemp == 20.0: self.GGGTemp = numpy.nan
         if self.tFAA.get() == 0 or self.FAATemp == 45.0: self.FAATemp = numpy.nan
-        newTemps += [self.GGGTemp,self.FAATemp]
+        self.newTemps += [self.GGGTemp,self.FAATemp]
         #append temp array to tempHistory, soon have it save to file
-        self.tempHistory.append(newTemps)
-        self.timeStamps.append(time.time() - self.startTime)
+        self.timeStamps = numpy.append(self.timeStamps,time.time() - self.startTime)
         #save temps in file
         with open(FILE_PATH+'\\temperatures'+self.dateAppend+'.txt','a') as f:
-            f.write(str(self.timeStamps[-1]) + '\t' + '\t'.join(map(str,newTemps))+'\n')
+            f.write(str(self.timeStamps[-1]) + '\t' + '\t'.join(map(str,self.newTemps))+'\n')
         #set x limits
-        xCyclesMin = max(0,i-self.wScale.get())
-        if self.wScale.get() == 600: xCyclesMin = 0
+        xCyclesMin = max(0,i-60*self.wScale.get())
+        if self.wScale.get() == 1440: xCyclesMin = 0
         xMin = self.timeStamps[xCyclesMin]
         #change data to plot
-        self.stage60K.set_xdata(self.timeStamps[xCyclesMin:])
-        self.stage60K.set_ydata([x[0] for x in self.tempHistory[xCyclesMin:]])
-        self.stage03K.set_xdata(self.timeStamps[xCyclesMin:])
-        self.stage03K.set_ydata([x[1] for x in self.tempHistory[xCyclesMin:]])
-        self.stageGGG.set_xdata(self.timeStamps[xCyclesMin:])
-        self.stageGGG.set_ydata([x[2] for x in self.tempHistory[xCyclesMin:]])
-        self.stageFAA.set_xdata(self.timeStamps[xCyclesMin:])
-        self.stageFAA.set_ydata([x[3] for x in self.tempHistory[xCyclesMin:]])
+        self.stage60K.set_xdata(self.timeStamps)
+        self.stage60K.set_ydata(numpy.append(self.stage60K.get_ydata(),self.newTemps[0]))
+        self.stage03K.set_xdata(self.timeStamps)
+        self.stage03K.set_ydata(numpy.append(self.stage03K.get_ydata(),self.newTemps[1]))
+        self.stageGGG.set_xdata(self.timeStamps)
+        self.stageGGG.set_ydata(numpy.append(self.stageGGG.get_ydata(),self.newTemps[2]))
+        self.stageFAA.set_xdata(self.timeStamps)
+        self.stageFAA.set_ydata(numpy.append(self.stageFAA.get_ydata(),self.newTemps[3]))
         #rescale axes, with the x being scaled by the slider
-        lineAndVar = {self.stage60K:self.t60K, self.stage03K:self.t3K, self.stageGGG:self.tGGG, self.stageFAA:self.tFAA}
-        ignoreSetBounds = True
-        for line in lineAndVar.keys():
-            if lineAndVar[line].get() == 0: line.set_visible(False)
-            else:
-                line.set_visible(True)
-                xy = numpy.vstack(line.get_data()).T
-                self.ax.dataLim.update_from_data_xy(xy, ignore=ignoreSetBounds)
-                ignoreSetBounds = False
-        if len(self.tempHistory)>1: self.ax.set_xlim(xMin,self.timeStamps[-1])
-        self.ax.autoscale_view(scalex=False)
-        #self.addLabelsOnRight()
+        if self.toolbar._active == 'HOME' or self.toolbar._active == None:
+            ymin,ymax = 10000000, -10000000
+            lineAndVar = {self.stage60K:self.t60K, self.stage03K:self.t3K, self.stageGGG:self.tGGG, self.stageFAA:self.tFAA}
+            for line in lineAndVar.keys():
+                if lineAndVar[line].get() == 0: line.set_visible(False)
+                else:
+                    line.set_visible(True)
+                    ydata = line.get_ydata()[xCyclesMin:-1]
+                    try:
+                        ymin = min(ymin, numpy.nanmin(ydata))
+                        ymax = max(ymax, numpy.nanmax(ydata))
+                    except ValueError as e: pass
+            if len(self.timeStamps)>1: 
+                self.ax.set_xlim(xMin,self.timeStamps[-1])
+                self.ax.set_ylim(ymin - (ymax-ymin)/10, ymax + (ymax-ymin)/10)
         self.updateLegend()
         self.canvas.draw()
         self.cycle += 1
@@ -411,31 +443,11 @@ class ADRController(Tkinter.Tk):
         """creates the legend at the top of the temperature plot."""
         labelOrder = ['60K','3K ','GGG','FAA']
         lines = [self.stage60K,self.stage03K,self.stageGGG,self.stageFAA]
-        labels = [labelOrder[l]+' ['+"{0:.3f}".format(self.tempHistory[-1][l])+'K]' for l in range(len(labelOrder))]
+        labels = [labelOrder[l]+' ['+"{0:.3f}".format(self.newTemps[l])+'K]' for l in range(len(labelOrder))]
         labels = [s.replace('1.#QOK','OoR') for s in labels]
         #self.ax.legend(lines,labels,loc=0)#,bbox_to_anchor=(1.01, 1)) #legend in upper right
         self.ax.legend(lines,labels,bbox_to_anchor=(0., 1.02, 1., .102), loc=3,
            ncol=4, mode="expand", borderaxespad=0.) #legend on top (if not using this, delete \n in title)
-    def addLabelsOnRight(self):
-        """add labels with temps on the right.  labels avoid each other automatically.
-            currently disabled and replaced with a bar legend at the top."""
-        labelDict = {'60K':self.tempHistory[-1][0],'3K':self.tempHistory[-1][1],'GGG':self.tempHistory[-1][2],'FAA':self.tempHistory[-1][3]}
-        sortedLabels = sorted(labelDict.items(), key=itemgetter(1))
-        sortedLabels.reverse()
-        minLabelSpread = (self.ax.get_ylim()[1]-self.ax.get_ylim()[0])/50
-        for j in range(len(sortedLabels)-1):
-            if sortedLabels[j][1] - sortedLabels[j+1][1] < minLabelSpread:
-                sortedLabels[j+1] = (sortedLabels[j+1][0],sortedLabels[j][1]+minLabelSpread)
-        labelOrder = ['60K','3K','GGG','FAA']
-        labels = [key+' ['+"{0:.3f}".format(labelDict[key])+'K]' for key in labelOrder]
-        labelLevels = [dict(sortedLabels)[key] for key in labelOrder]
-        pylab.yticks(labelLevels,labels)
-        colorScheme = ['blue','green','red','teal']
-        for n in range(len(self.tempHistory[-1])):
-            l = self.ax2.yaxis.get_ticklabels()[n]
-            l.set_color(colorScheme[n])
-        self.ax2.set_ylim(self.ax.get_ylim())
-        self.canvas.draw()
     def renewPowerSupply(self):
         """This runs once a minute and checks if the power supply has since been
             turned on or off, and refreshes the instance of it."""
@@ -444,6 +456,25 @@ class ADRController(Tkinter.Tk):
         if alreadyConnected == False and self.ps.instrumentIsConnected()[0] == True:
             self.ps.initiate()
         self.after(60*1000, self.renewPowerSupply)
+    def executeExternalCommands(self):
+        """Commands:
+                ['magup'] - mags up to 9A
+                ['magdown'] - mags all the way down, with temp goal of 0
+                ['regulate'] - regulates at the temp already entered
+                ['regulate',0.15] - regulates at 150mK
+                ['gettemp'] - returns the temperature of the cold stage
+        """
+        address = ('localhost', 6000)     # family is deduced to be 'AF_INET'
+        #listener = Listener(address, authkey='secret password')
+        #conn = listener.accept()
+        #print 'connection accepted from', listener.last_accepted
+        """while True:
+            msg = conn.recv()
+            # do something with msg
+            if msg == 'close':
+                conn.close()
+                break
+        listener.close()"""
     def magUp(self):
          """ The magging up method, as per the HPD Manual, involves increasing the voltage in steps of MAG_UP_dV volts
          every cycle of the loop.  This cycle happens once every STEP_LENGTH seconds, nominally 1s (since the voltage
@@ -479,7 +510,7 @@ class ADRController(Tkinter.Tk):
                  local.lastI = I_now
                  local.lastTime = time.time()
                  if I_now < CURRENT_LIMIT:
-                     if self.sim922.getMagnetVoltage() < MAGNET_VOLTAGE_LIMIT and abs(dI/dt) < dIdt_MAGUP_LIMIT:
+                     if self.magnetVoltageMonitor.getMagnetVoltage() < MAGNET_VOLTAGE_LIMIT and abs(dI/dt) < dIdt_MAGUP_LIMIT:
                          newVoltage = self.ps.getVoltage() + MAG_UP_dV
                          if newVoltage < VOLTAGE_LIMIT:
                              self.ps.setVoltage(newVoltage)
@@ -500,7 +531,7 @@ class ADRController(Tkinter.Tk):
         """ This function is almost equivalent to the old code that Steve Sendelbach had implemented in LabVIEW.  It is
         based on a PID controller.  I also added a VOLTAGE_LIMIT case.  The basics of it is that a new voltage V+dV is
         proposed.  dV is then limited as necessary, and the new voltage is set. As with magging up, regulate runs a cycle
-        at approximately once per second (plus processing time). Called when regulate button is pressed. """
+        at approximately once per second. Called when regulate button is pressed. """
         T_target = float(self.regulateTempField.get())
         if self.ps.instrumentIsConnected()[0] == False:
             message = 'Cannot regulate: Power Supply not connected.  Please turn it on and wait a minute or two.\n'
@@ -516,11 +547,11 @@ class ADRController(Tkinter.Tk):
             lastTime = time.time()
             lastMagnetV = 0
             lastI = self.ps.getCurrent()
-            FAATemp = self.ruox.getTemperature()
-            if FAATemp == numpy.nan: FAATemp = self.tempHistory[-1][1]
+            FAATemp = self.ruoxTempMonitor.getTemperature()
+            if FAATemp == numpy.nan: FAATemp = self.newTemps[1]
         def cancelRegulate():
             if local._job is not None:
-                root.after_cancel(local._job)
+                self.after_cancel(local._job)
                 local._job = None
             self.regulateButton.configure(text='Regulate', command=self.regulate)
             self.magUpButton.configure(state=Tkinter.NORMAL)
@@ -530,16 +561,16 @@ class ADRController(Tkinter.Tk):
         def oneRegCycle():
             if self.isRegulating:
                 startTime = time.time()
-                backEMF = self.sim922.getMagnetVoltage()
+                backEMF = self.magnetVoltageMonitor.getMagnetVoltage()
                 V_now = self.ps.getVoltage()
                 I_now = self.ps.getCurrent()
                 dI = I_now - local.lastI
                 local.lastI = I_now
-                if self.ruox.getChannel() == 2: local.FAATemp = self.ruox.getTemperature()
-                if local.FAATemp == numpy.nan: local.FAATemp = self.tempHistory[-1][1]
+                if self.ruoxTempMonitor.getChannel() == 2: local.FAATemp = self.ruoxTempMonitor.getTemperature()
+                if local.FAATemp == numpy.nan: local.FAATemp = self.newTemps[1]
                 print str(V_now)+'\t'+str(backEMF)+'\t',
                 #propose new voltage
-                dV = T_target-local.FAATemp-backEMF*MAGNET_VOLTAGE_GAIN
+                dV = PID_KP*(T_target-local.FAATemp)-backEMF*PID_KD
                 dT = time.time()-local.lastTime
                 if dT == 0: dT = 0.0000000001 #to prevent divide by zero error
                 local.lastTime = time.time()
@@ -590,6 +621,14 @@ class ADRController(Tkinter.Tk):
                         # Fatal Python Error: PyEval_RestoreThread: NULL tstate
 
 if __name__ == "__main__":
-    app = ADRController(None)
+    """Define your instruments here.  This allows for easy exchange between different
+    devices to monitor temperature, etc.  For example, the new and old ADR's use two
+    different instruments to measure temperature: The SRS module and the Lakeview 218."""
+    try: ruoxTempMonitor = RuOxTemperatureMonitor()
+    except GPIBError as e: ruoxTempMonitor = None
+    try: diodeTempMonitor = SIM922()
+    except GPIBError as e: diodeTempMonitor = None
+    magnetVoltageMonitor = diodeTempMonitor
+    app = ADRController(None, diodeTempMonitor, ruoxTempMonitor, magnetVoltageMonitor)
     app.title('ADR Controller')
     app.mainloop()
