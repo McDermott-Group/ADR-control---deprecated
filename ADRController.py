@@ -5,7 +5,7 @@ SIM925_SLOT = 6 #multiplexer
 MAGNET_VOLTAGE_LIMIT = 0.1      #Back EMF limit in Volts
 MAG_UP_dV = 0.003               #[V/step] How much do we increase the voltage by every second when maggin up? HPD Manual uses 10mV=0.01V, 2.5V/30min=1.4mV/s ==> Let's use a middle rate of 3mV/step. (1 step is about 1s)
 CURRENT_LIMIT = 9               #Max Current in Amps
-VOLTAGE_LIMIT = 3               #Maxx Voltage in Volts.  At 9A, we usually get about 2.5-2.7V, so this shouldn't need to be more than 3
+VOLTAGE_LIMIT = 2               #Maxx Voltage in Volts.  At 9A, we usually get about 2.5-2.7V or 1.69V (with or without the external diode protection box), so this shouldn't need to be more than 3 or 2
 MAGNET_VOLTAGE_GAIN = 0.1       #Regulate loop uses a PID-esque process.  This is the gain constant.
 dVdT_LIMIT = 0.008              #Keep dV/dt to under this value [V/s]
 dIdt_MAGUP_LIMIT = 9./(30*60)   #limit on the rate at which we allow current to increase in amps/s (we want 9A over 30 min)
@@ -17,7 +17,6 @@ FILE_PATH = 'Z:\\mcdermott-group\\ADR_log_files\\NEW_ADR'
 import visa, pyvisa
 import matplotlib as mpl
 mpl.use('TkAgg')
-import numpy as np
 import pylab, numpy
 import time, datetime
 import threading
@@ -29,7 +28,7 @@ class GPIBError(Exception):
      def __init__(self, value):
          self.value = value
      def __str__(self):
-         return 'Could not create device from string "' + str(self.value) + '"...Make sure all instruments are powered on and try again.'
+         return 'Could not create device from string "' + str(self.value) + '"... Make sure all instruments are powered on and try again.'
 
 """Searches through available devices with *IDN? and returns device with name that includes deviceName."""
 def getGPIB(deviceName):
@@ -73,6 +72,7 @@ class SIM922:
         self.SIM900.write("xyz")
         magnetVoltages = [float(x) for x in diodeMonitorReturnString.split(',')][2:]
         return (abs(magnetVoltages[0])+abs(magnetVoltages[1]))/2
+		
 """ This class implements both the SIM921 AC Resistance Bridge for measuring the RuOx temperature sensors,
     and the SIM925 Multiplexor to select which channel (read: RuOx detector) to read. The multiplexer clicks
     a lot if you want it to switch back and forth rapidly so as to measure the temperature on the AC bridge
@@ -114,20 +114,22 @@ class RuOxTemperatureMonitor:
         T = float(gpibstring.strip('\x00')) 
         self.SIM900.write("xyz")
         return T
+		
 """ This class should be able to manage all controls for the power supply.  Setting Voltage and Current works
     just as it would if you were to turn the knobs on the power supply itself.  getObsReg() returns the operating
     mode of the power supply, ex: Current Control (CC). """
 class PowerSupply:
     def __init__(self,log):
         self.log = log
+        self.initError = None
         try: self.instrument = getGPIB('6641A')
         except GPIBError as e:
-             self.log.log(str(e),alert=True)
+             self.initError = str(e)
              self.instrument = None
     def instrumentIsConnected(self):
         if self.instrument == None:
-            return False
-        else: return True
+            return (False, self.initError)
+        else: return (True, self.initError)
     def getCurrent(self):
         return float(self.instrument.ask('MEAS:CURR?').strip('\x00'))
     def getVoltage(self):
@@ -154,30 +156,28 @@ class PowerSupply:
         else: return 'OutputOff'
     def initiate(self):
         if self.getCurrent()-0.01 >= CURRENT_LIMIT:
-            message = 'Current too high!  Manually lower before trying to run again.  Please quit now. \n'
+            message = 'Current too high! Manually lower before trying to run again. Please quit now.\n'
             self.log.log(message, alert=True)
         else:
             state = self.getOpsReg()
             if state == 'OutputOff':
-                message = 'Output Off.  Setting Current to '+str(CURRENT_LIMIT)+' Amps and voltage to 0 Volts. \n'
+                message = 'Output Off. Setting Current to '+str(CURRENT_LIMIT)+' Amps and voltage to 0 Volts.\n'
                 self.log.log(message)
                 self.reset()
                 self.setCurrent(CURRENT_LIMIT)
                 self.setVoltage(0)
                 self.setOutputOn()
             elif state == 'CV Mode':
-                message = 'Starting in CV Mode.  Setting Current to '+str(CURRENT_LIMIT)+' Amps. \n'
+                message = 'Starting in CV Mode. Setting Current to '+str(CURRENT_LIMIT)+' Amps.\n'
                 self.log.log(message)
                 self.setCurrent( CURRENT_LIMIT )
             elif state == 'CC Mode':
                 V_now = self.getVoltage()
-                message = 'Starting in CC Mode.  Setting Current to '+str(CURRENT_LIMIT)+' Amps and voltage to '+str(V_now)+' Volts. \n'
+                message = 'Starting in CC Mode. Setting Current to '+str(CURRENT_LIMIT)+' Amps and voltage to '+str(V_now)+' Volts.\n'
                 self.log.log(message)
                 V_now = self.getVoltage()
                 self.setVoltage( V_now )
                 self.setCurrent( CURRENT_LIMIT )
-
-
 
 """Inherited from the Tkinter Entry widget, this just turns red when a limit is reached"""
 class EntryWithAlert(Tkinter.Entry):
@@ -206,7 +206,7 @@ class LogBox(Tkinter.Text):
         self.configure(state=Tkinter.DISABLED)
     def log(self, message, alert=False):
         dt = datetime.datetime.now()
-        messageWithTimeStamp = dt.strftime("[%m/%d/%y %H:%M:%S]") + message
+        messageWithTimeStamp = dt.strftime("[%m/%d/%y %H:%M:%S] ") + message
         self.configure(state=Tkinter.NORMAL)
         self.insert(1.0,messageWithTimeStamp)
         if alert: self.tag_add("redAlert", '1.0', '1.end')
@@ -234,6 +234,7 @@ class ADRController(Tkinter.Tk):
         self.initializeWindow()
         self.initializeInstruments()
         self.after(100, self.measurementCycle)
+        self.after(200, self.renewPowerSupply)
     def initializeWindow(self):
         root = self
         #set up window
@@ -318,9 +319,12 @@ class ADRController(Tkinter.Tk):
         #X BUTTON
         self.protocol("WM_DELETE_WINDOW", self._quit)
     def initializeInstruments(self):
+        """This method simply creates the instances of the power suply, sim922, and ruox temperature monitor."""
         self.ps = PowerSupply(self.log)
-        if self.ps.instrumentIsConnected() == False:
-            message = 'Power Supply not connected.  Please turn it on and restart program. \n'
+        con, err = self.ps.instrumentIsConnected()
+        if con == False:
+            self.log.log(err, alert=True)
+            message = 'Power Supply not connected. Please turn it on and wait a minute or two.\n'
             self.log.log(message, alert=True)
         else:
             self.ps.initiate()
@@ -334,10 +338,10 @@ class ADRController(Tkinter.Tk):
         cycleStartTime = time.time()
         #update current and voltage data
         self.currentBackEMF.set( "{0:.3f}".format(self.sim922.getMagnetVoltage()) )
-        if self.ps.instrumentIsConnected() == True:
+        if self.ps.instrumentIsConnected()[0] == True:
             try:
-                self.currentI.set( "{0:.3f}".format(ps.getCurrent()) )
-                self.currentV.set( "{0:.3f}".format(ps.getVoltage()) )
+                self.currentI.set( "{0:.3f}".format(self.ps.getCurrent()) )
+                self.currentV.set( "{0:.3f}".format(self.ps.getVoltage()) )
             except:
                 self.currentI.set('')
                 self.currentV.set('')
@@ -404,6 +408,7 @@ class ADRController(Tkinter.Tk):
         cycleLength = int(1000*(time.time() - cycleStartTime))
         self.after(max(0,STEP_LENGTH-cycleLength),self.measurementCycle)
     def updateLegend(self):
+        """creates the legend at the top of the temperature plot."""
         labelOrder = ['60K','3K ','GGG','FAA']
         lines = [self.stage60K,self.stage03K,self.stageGGG,self.stageFAA]
         labels = [labelOrder[l]+' ['+"{0:.3f}".format(self.tempHistory[-1][l])+'K]' for l in range(len(labelOrder))]
@@ -431,15 +436,23 @@ class ADRController(Tkinter.Tk):
             l.set_color(colorScheme[n])
         self.ax2.set_ylim(self.ax.get_ylim())
         self.canvas.draw()
+    def renewPowerSupply(self):
+        """This runs once a minute and checks if the power supply has since been
+            turned on or off, and refreshes the instance of it."""
+        alreadyConnected,err = self.ps.instrumentIsConnected()
+        self.ps = PowerSupply(self.log)
+        if alreadyConnected == False and self.ps.instrumentIsConnected()[0] == True:
+            self.ps.initiate()
+        self.after(60*1000, self.renewPowerSupply)
     def magUp(self):
          """ The magging up method, as per the HPD Manual, involves increasing the voltage in steps of MAG_UP_dV volts
          every cycle of the loop.  This cycle happens once every STEP_LENGTH seconds, nominally 1s (since the voltage
          monitor reads once a second).  Each cycle, the voltage across the magnet is read to get the backEMF.  If it
          is greater than the MAGNET_VOLTAGE_LIMIT, the voltage will not be raised until the next cycle for which the
          backEMF < MAGNET_VOLTAGE_LIMIT. Called when Mag Up button is pressed. """
-         self.log.log('Beginning to mag up to '+str(CURRENT_LIMIT)+' Amps. \n')
-         if self.ps.instrumentIsConnected() == False:
-             message = 'Cannot mag up: Power Supply not connected.  Please turn it on and restart program. \n'
+         self.log.log('Beginning to mag up to '+str(CURRENT_LIMIT)+' Amps.\n')
+         if self.ps.instrumentIsConnected()[0] == False:
+             message = 'Cannot mag up: Power Supply not connected. Please turn it on and wait a minute or two.\n'
              self.log.log(message, alert=True)
              return
          self.isMaggingUp = True
@@ -454,7 +467,7 @@ class ADRController(Tkinter.Tk):
                  self.isMaggingUp = False
              self.magUpButton.configure(text='Mag Up', command=self.magUp)
              self.regulateButton.configure(state=Tkinter.NORMAL)
-             message = 'Magging up stopped at a current of '+str(self.ps.getCurrent())+' Amps. \n'
+             message = 'Magging up stopped at a current of '+str(self.ps.getCurrent())+' Amps.\n'
              self.log.log(message)
          def increaseV():
              if self.isMaggingUp:
@@ -477,8 +490,8 @@ class ADRController(Tkinter.Tk):
                      local._job = self.after(max(0,STEP_LENGTH-cycleLength), increaseV)
                  else:
                      self.magUpButton.configure(text='Mag Up', command=self.magUp)
-                     regulateButton.configure(state=Tkinter.NORMAL)
-                     message = 'Finished magging up. '+str(self.ps.getCurrent())+' Amps reached. \n'
+                     self.regulateButton.configure(state=Tkinter.NORMAL)
+                     message = 'Finished magging up. '+str(self.ps.getCurrent())+' Amps reached.\n'
                      self.log.log(message)
          self.magUpButton.configure(text='Stop Magging Up', command=cancelMagUp)
          self.regulateButton.configure(state=Tkinter.DISABLED)
@@ -489,11 +502,11 @@ class ADRController(Tkinter.Tk):
         proposed.  dV is then limited as necessary, and the new voltage is set. As with magging up, regulate runs a cycle
         at approximately once per second (plus processing time). Called when regulate button is pressed. """
         T_target = float(self.regulateTempField.get())
-        if self.ps.instrumentIsConnected() == False:
-            message = 'Cannot regulate: Power Supply not connected.  Please turn it on and restart program. \n'
+        if self.ps.instrumentIsConnected()[0] == False:
+            message = 'Cannot regulate: Power Supply not connected.  Please turn it on and wait a minute or two.\n'
             self.log.log(message, alert=True)
             return
-        message = 'Starting regulation cycle from '+str(self.ps.getCurrent())+' Amps. \n'
+        message = 'Starting regulation cycle from '+str(self.ps.getCurrent())+' Amps.\n'
         self.log.log(message)
         self.isRegulating = True
         print 'beginning regulation'
@@ -511,7 +524,7 @@ class ADRController(Tkinter.Tk):
                 local._job = None
             self.regulateButton.configure(text='Regulate', command=self.regulate)
             self.magUpButton.configure(state=Tkinter.NORMAL)
-            message = 'Regulation stopped at a current of '+str(self.ps.getCurrent())+' Amps. \n'
+            message = 'Regulation stopped at a current of '+str(self.ps.getCurrent())+' Amps.\n'
             self.log.log(message)
             self.isRegulating = False
         def oneRegCycle():
@@ -565,7 +578,7 @@ class ADRController(Tkinter.Tk):
                 else:
                     self.regulateButton.configure(text='Regulate', command=self.regulate)
                     self.magUpButton.configure(state=Tkinter.NORMAL)
-                    message = 'Regulation has completed.  Mag up and try again. \n'
+                    message = 'Regulation has completed. Mag up and try again.\n'
                     self.log.log(message)
         self.regulateButton.configure(text='Stop Regulating', command=cancelRegulate)
         self.magUpButton.configure(state=Tkinter.DISABLED)
