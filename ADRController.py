@@ -22,6 +22,7 @@ import time, datetime
 import threading
 import Tkinter
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2TkAgg
+from operator import itemgetter
 
 """Searches through available devices with *IDN? and returns device with name that includes deviceName."""
 def getGPIB(deviceName):
@@ -191,6 +192,7 @@ def magUp():
         message = 'Magging up stopped at a current of '+str(ps.getCurrent())+' Amps. \n'
         log.log(message)
     def increaseV():
+        startTime = time.time()
         I_now = ps.getCurrent()
         dI = I_now-local.lastI
         dt = time.time() - local.lastTime
@@ -205,7 +207,8 @@ def magUp():
                 else: ps.setVoltage(VOLTAGE_MAX)
                 #newCurrent = ps.getCurrent() + 0.005
                 #ps.setCurrent(newCurrent)
-            local._job = root.after(STEP_LENGTH, increaseV)
+            now = int(1000*(time.time() - startTime))
+            local._job = root.after(max(0,STEP_LENGTH-now), increaseV)
         else:
             magUpButton.configure(text='Mag Up', command=magUp)
             regulateButton.configure(state=Tkinter.NORMAL)
@@ -247,6 +250,7 @@ def regulate():
         message = 'Regulation stopped at a current of '+str(ps.getCurrent())+' Amps. \n'
         log.log(message)
     def oneRegCycle():
+        startTime = time.time()
         backEMF = sim922.getMagnetVoltage()
         V_now = ps.getVoltage()
         I_now = ps.getCurrent()
@@ -289,7 +293,8 @@ def regulate():
             runCycleAgain = False
         print str(dV)
         ps.setVoltage(V_now + dV)
-        if runCycleAgain: local._job = root.after(STEP_LENGTH, oneRegCycle)
+        now = int(1000*(time.time() - startTime))
+        if runCycleAgain: local._job = root.after(max(0,STEP_LENGTH-now), oneRegCycle)
         else:
             regulateButton.configure(text='Regulate', command=regulate)
             magUpButton.configure(state=Tkinter.NORMAL)
@@ -306,8 +311,8 @@ timeStamps = []
 def tempPlot():
     class local:
         i = 0
-        GGGTemp = 0
-        FAATemp = 0
+        GGGTemp = numpy.nan
+        FAATemp = numpy.nan
         ruoxChan = 'FAA'
         startTime = time.time()
     sim922 = SIM922()
@@ -327,11 +332,16 @@ def tempPlot():
     stageFAA, = ax.plot([],[])
     def oneTempCycle():
         global currentBackEMF, currentI, currentV, t60K, t3K, tGGG, tFAA
+        startTime = time.time()
         #update current and voltage data
         currentBackEMF.set( "{0:.3f}".format(sim922.getMagnetVoltage()) )
         if ps.instrumentIsConnected() == True:
-            currentI.set( "{0:.3f}".format(ps.getCurrent()) )
-            currentV.set( "{0:.3f}".format(ps.getVoltage()) )
+            try:
+                currentI.set( "{0:.3f}".format(ps.getCurrent()) )
+                currentV.set( "{0:.3f}".format(ps.getVoltage()) )
+            except:
+                currentI.set('')
+                currentV.set('')
         else:
             currentI.set('')
             currentV.set('')
@@ -354,17 +364,24 @@ def tempPlot():
             elif tGGG.get() == 0 and tFAA.get() == 1:
                 ruox.setChannel(2)
                 local.ruoxChan = 'FAA'
+        if tGGG.get() == 0: local.GGGTemp = numpy.nan
+        if tFAA.get() == 0: local.FAATemp = numpy.nan
         newTemps += [local.GGGTemp,local.FAATemp]
         tempHistory.append(newTemps)
         timeStamps.append(time.time() - local.startTime)
-        stage60K.set_xdata(numpy.append(stage60K.get_xdata(),local.i))
-        stage60K.set_ydata(numpy.append(stage60K.get_ydata(),tempHistory[-1][0]))
-        stage03K.set_xdata(numpy.append(stage03K.get_xdata(),local.i))
-        stage03K.set_ydata(numpy.append(stage03K.get_ydata(),tempHistory[-1][1]))
-        stageGGG.set_xdata(numpy.append(stageGGG.get_xdata(),local.i))
-        stageGGG.set_ydata(numpy.append(stageGGG.get_ydata(),tempHistory[-1][2]))
-        stageFAA.set_xdata(numpy.append(stageFAA.get_xdata(),local.i))
-        stageFAA.set_ydata(numpy.append(stageFAA.get_ydata(),tempHistory[-1][3]))
+        #set x limits
+        xCyclesMin = max(0,local.i-wScale.get())
+        if wScale.get() == 600: xCyclesMin = 0
+        xMin = timeStamps[xCyclesMin]
+        #change data to plot
+        stage60K.set_xdata(timeStamps[xCyclesMin:])
+        stage60K.set_ydata([x[0] for x in tempHistory[xCyclesMin:]])
+        stage03K.set_xdata(timeStamps[xCyclesMin:])
+        stage03K.set_ydata([x[1] for x in tempHistory[xCyclesMin:]])
+        stageGGG.set_xdata(timeStamps[xCyclesMin:])
+        stageGGG.set_ydata([x[2] for x in tempHistory[xCyclesMin:]])
+        stageFAA.set_xdata(timeStamps[xCyclesMin:])
+        stageFAA.set_ydata([x[3] for x in tempHistory[xCyclesMin:]])
         #rescale axes, with the x being scaled by the slider
         lineAndVar = {stage60K:t60K, stage03K:t3K, stageGGG:tGGG, stageFAA:tFAA}
         ignoreSetBounds = True
@@ -375,21 +392,19 @@ def tempPlot():
                 xy = numpy.vstack(line.get_data()).T
                 ax.dataLim.update_from_data_xy(xy, ignore=ignoreSetBounds)
                 ignoreSetBounds = False
-        xMin = local.i-wScale.get()
-        if wScale.get() == 600: xMin = 0
-        if len(tempHistory)>1: ax.set_xlim(xMin,local.i)
+        if len(tempHistory)>1: ax.set_xlim(xMin,timeStamps[-1])
         ax.autoscale_view(scalex=False)
         #add labels with temps on the right
-        labelLevels = list(newTemps)
-        for k in range(len(newTemps)):
-            for j in range(k+1,len(newTemps)):
-                minLabelSpread = (ax.get_ylim()[1]-ax.get_ylim()[0])/50
-                if abs(newTemps[k]-newTemps[j])<minLabelSpread:
-                    avgTemp = (newTemps[k]+newTemps[j])/2
-                    labelLevels[k] = avgTemp + minLabelSpread/2*(newTemps[k]-avgTemp)/(abs(newTemps[k]-avgTemp)+0.0001) # + .0001 to prevent divide by 0 error
-                    labelLevels[j] = avgTemp + minLabelSpread/2*(newTemps[j]-avgTemp)/(abs(newTemps[j]-avgTemp)+0.0001) # + .0001 to prevent divide by 0 error
-        labels = ['60K','3K','GGG','FAA']
-        labels = [labels[l]+' ['+"{0:.3f}".format(newTemps[l])+'K]' for l in range(len(labels))]
+        labelDict = {'60K':newTemps[0],'3K':newTemps[1],'GGG':newTemps[2],'FAA':newTemps[3]}
+        sortedLabels = sorted(labelDict.items(), key=itemgetter(1))
+        sortedLabels.reverse()
+        minLabelSpread = (ax.get_ylim()[1]-ax.get_ylim()[0])/50
+        for i in range(len(sortedLabels)-1):
+            if sortedLabels[i][1] - sortedLabels[i+1][1] < minLabelSpread:
+                sortedLabels[i+1] = (sortedLabels[i+1][0],sortedLabels[i][1]+minLabelSpread)
+        labelOrder = ['60K','3K','GGG','FAA']
+        labels = [key+' ['+"{0:.3f}".format(labelDict[key])+'K]' for key in labelOrder]
+        labelLevels = [dict(sortedLabels)[key] for key in labelOrder]
         pylab.yticks(labelLevels,labels)
         colorScheme = ['blue','green','red','teal']
         for n in range(len(newTemps)):
@@ -398,22 +413,27 @@ def tempPlot():
         ax2.set_ylim(ax.get_ylim())
         canvas.draw()
         local.i+=1
-        root.after(STEP_LENGTH,oneTempCycle)
+        now = int(1000*(time.time() - startTime))
+        root.after(max(0,STEP_LENGTH-now),oneTempCycle)
     oneTempCycle()
 
 """ called when the window is closed. Before quitting, we save the logfile to log.txt, and the temperatures to temperatures.txt"""
 def _quit():
     filePath = 'Z:\\mcdermott-group\\ADR_log_files\\NEW_ADR'
     dt = datetime.datetime.now()
-    dateAppend = dt.strftime("_%y%m%d_%I%M")
+    dateAppend = dt.strftime("_%y%m%d_%H%M")
     try:
+        startTime = time.time()
         timeStampsArray = numpy.array([timeStamps])
         tempsArray = numpy.array(tempHistory)
         saveArray = numpy.concatenate((timeStampsArray,tempsArray.T)).T
+        print time.time() - startTime
         np.savetxt(filePath+'\\temperatures'+dateAppend+'.txt',saveArray,delimiter='\t')
+        print time.time() - startTime
         f = open(filePath+'\\log'+dateAppend+'.txt', 'w')
         f.write( log.get("1.0",Tkinter.END) )
         f.close()
+        print time.time() - startTime
     except Exception, e:
         print e
     root.quit()     # stops mainloop
@@ -494,7 +514,7 @@ t4checkbox = Tkinter.Checkbutton(tempSelectFrame, text = '50mK Stage (FAA)', var
 t4checkbox.pack(side=Tkinter.LEFT)
 
 #scale to adjust time shown in temp plot
-wScale = Tkinter.Scale(master=root,label="Time Displayed [s]", from_=1, to=600,sliderlength=30,length=500, orient=Tkinter.HORIZONTAL)
+wScale = Tkinter.Scale(master=root,label="Cycles Displayed (1 cycle ~ 1 sec)", from_=1, to=600,sliderlength=30,length=500, orient=Tkinter.HORIZONTAL)
 wScale.set(700)
 wScale.pack(side=Tkinter.TOP)
 
